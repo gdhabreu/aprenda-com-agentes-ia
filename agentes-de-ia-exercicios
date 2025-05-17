@@ -1,0 +1,195 @@
+%pip -q install google-genai google-adk
+
+import os
+from google.colab import userdata
+from google import genai
+from google.adk.agents import Agent
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.adk.tools import google_search
+from google.genai import types
+from datetime import date
+import textwrap
+from IPython.display import HTML, Markdown
+import requests
+import warnings
+import time
+import random
+
+warnings.filterwarnings("ignore")
+
+# Configuração da API Key (SUBSTITUA PELA SUA API KEY EM: 'GOOGLE_SUA_API_KEY'
+try:
+    os.environ["GOOGLE_API_KEY"] = userdata.get('GOOGLE_SUA_API_KEY')
+except KeyError:
+    print("Erro: A variável de ambiente GOOGLE_API_KEY não está configurada no Colab Userdata.")
+    print("Por favor, configure a chave da API e tente novamente.")
+    exit()
+
+# Configuração do cliente Gemini
+try:
+    client = genai.Client()
+except Exception as e:
+    print(f"Erro ao inicializar o cliente Gemini: {e}")
+    exit()
+
+MODEL_ID = "gemini-2.0-flash" # Usando um modelo com camada gratuita
+
+# Funções auxiliares (mantemos as mesmas)
+
+def call_agent(agent: Agent, message_text: str) -> str:
+    """Envia uma mensagem para um agente e retorna a resposta final."""
+    session_service = InMemorySessionService()
+    session = session_service.create_session(app_name=agent.name, user_id="user1", session_id="session1")
+    runner = Runner(agent=agent, app_name=agent.name, session_service=session_service)
+    content = types.Content(role="user", parts=[types.Part(text=message_text)])
+
+    final_response = ""
+    try:
+        for event in runner.run(user_id="user1", session_id="session1", new_message=content):
+            if event.is_final_response():
+                for part in event.content.parts:
+                    if part.text is not None:
+                        final_response += part.text
+                        final_response += "\n"
+    except Exception as e:
+        print(f"Erro durante a execução do agente {agent.name}: {e}")
+        return "Ocorreu um erro ao executar o agente. Por favor, tente novamente mais tarde."
+    return final_response
+
+
+def call_agent_with_retry(agent: Agent, message_text: str, max_retries=3):
+    """Envia uma mensagem para um agente com retry."""
+    for i in range(max_retries):
+        try:
+            return call_agent(agent, message_text)
+        except google.genai.errors.ClientError as e:
+            if e.status_code == 429:  # RESOURCE_EXHAUSTED
+                wait_time = (2 ** i) + random.random()  # Backoff exponencial com jitter
+                print(f"Cota excedida. Tentando novamente em {wait_time:.2f} segundos...")
+                time.sleep(wait_time)
+            else:
+                raise  # Re-levanta outras exceções
+    return "Erro: Cota excedida após várias tentativas."  # Ou lance uma exceção aqui
+
+def to_markdown(text):
+    """Formata texto para Markdown no Colab."""
+    text = text.replace('•', '  *')
+    return Markdown(textwrap.indent(text, '> ', predicate=lambda _: True))
+
+def executar_busca_google(query: str) -> str:
+    """Executa uma busca no Google e retorna os resultados."""
+    try:
+        response = client.models.generate_content(
+            model=MODEL_ID,
+            contents=query,
+            config={"tools": [{"google_search": {}}]}
+        )
+
+        if response.candidates and response.candidates[0].grounding_metadata:
+            search_queries = response.candidates[0].grounding_metadata.web_search_queries
+            sites = response.candidates[0].grounding_metadata.grounding_chunks
+            rendered_content = response.candidates[0].grounding_metadata.search_entry_point.rendered_content
+
+            print(f"Busca realizada: {search_queries}")
+            print(f"Páginas utilizadas na resposta: {', '.join([site.web.title for site in sites])}")
+            display(HTML(rendered_content))
+            return response.text
+        else:
+            return "Nenhum resultado encontrado na busca."
+
+    except Exception as e:
+        print(f"Erro ao realizar a busca no Google: {e}")
+        return "Ocorreu um erro ao realizar a busca. Por favor, tente novamente."
+
+# Novos Agentes
+
+def agente_explicador(topico):
+    """Agente que busca uma explicação resumida e clara para um tópico."""
+    instruction = f"""
+        Você é um especialista em fornecer explicações claras e concisas sobre diversos tópicos.
+        Sua tarefa é usar a ferramenta de busca do Google (google_search) para encontrar uma explicação resumida e em linguagem clara sobre o seguinte tópico: {topico}.
+        Foque em encontrar explicações introdutórias e fáceis de entender, ideal para quem está começando a aprender sobre o assunto.
+        A explicação deve ter no máximo 3 parágrafos.
+        """
+    explicador = Agent(
+        name="agente_explicador",
+        model="gemini-2.0-flash",
+        instruction=instruction,
+        description="Agente que busca explicações claras e resumidas no Google",
+        tools=[google_search]
+    )
+    entrada_do_agente_explicador = f"Explique de forma resumida e clara o tópico: {topico}"
+    explicacao_encontrada = call_agent_with_retry(explicador, entrada_do_agente_explicador)
+    return explicacao_encontrada
+
+def agente_exercicios(topico, data_de_hoje):
+    """Agente que busca exercícios simples para praticar um tópico."""
+    instruction = f"""
+        Você é um especialista em encontrar exercícios práticos para auxiliar no aprendizado de um determinado tópico.
+        Sua tarefa é usar a ferramenta de busca do Google (google_search) para encontrar exercícios simples e de nível iniciante sobre o seguinte tópico: {topico}.
+        Busque por no máximo 3 a 5 exercícios com diferentes formatos (por exemplo, múltipla escolha, verdadeiro ou falso, lacunas para preencher).
+        Priorize exercícios que sejam recentes (últimos 6 meses) e que pareçam ter uma boa relevância para iniciantes.
+        Inclua as perguntas dos exercícios e, se possível, indique onde encontrar as respostas ou um gabarito.
+        Data de hoje: {data_de_hoje}
+        """
+    buscador_exercicios = Agent(
+        name="agente_exercicios",
+        model="gemini-2.0-flash",
+        instruction=instruction,
+        description="Agente que busca exercícios simples para praticar um tópico no Google",
+        tools=[google_search]
+    )
+    entrada_do_agente_exercicios = f"Encontre exercícios simples para praticar o tópico: {topico}"
+    exercicios_encontrados = call_agent_with_retry(buscador_exercicios, entrada_do_agente_exercicios)
+    return exercicios_encontrados
+
+def agente_integrador(topico, explicacao, exercicios):
+    """Agente que junta as informações da explicação e dos exercícios."""
+    instruction = f"""
+        Você é um integrador de informações. Sua tarefa é organizar a explicação fornecida sobre o tópico "{topico}" e a lista de exercícios encontrados.
+        Apresente primeiro a explicação de forma clara e concisa. Em seguida, liste os exercícios encontrados para praticar o tópico.
+        Organize os exercícios de forma que fiquem fáceis de identificar e resolver. Se possível, inclua alguma dica ou observação sobre como resolver os exercícios.
+        O objetivo final é fornecer um material completo e útil para alguém que deseja aprender e praticar sobre o tópico.
+        """
+    integrador = Agent(
+        name="agente_integrador",
+        model="gemini-2.0-flash",
+        instruction=instruction,
+        description="Agente que integra a explicação e os exercícios encontrados",
+        tools=[] # Este agente não precisa de ferramentas externas
+    )
+    entrada_do_agente_integrador = f"Tópico: {topico}\n\nExplicação: {explicacao}\n\nExercícios: {exercicios}"
+    resultado_final = call_agent_with_retry(integrador, entrada_do_agente_integrador)
+    return resultado_final
+
+# Fluxo principal com os novos agentes
+
+data_de_hoje = date.today().strftime("%d/%m/%Y")
+
+print("Iniciando a busca de informações para aprendizado...")
+
+topico = input("Por favor, digite o assunto que você quer aprender: ")
+
+if not topico:
+    print("Sem tópico não há pesquisa!")
+else:
+    print(f"Oba! Vamos aprender sobre: {topico}")
+
+    # Buscar explicação
+    explicacao = agente_explicador(topico)
+    print("\n--- 💡 Explicação do Tópico ---\n")
+    display(to_markdown(explicacao))
+    print("------------------------------------")
+
+    # Buscar exercícios
+    exercicios = agente_exercicios(topico, data_de_hoje)
+    print("\n--- ✍️ Exercícios para Praticar ---\n")
+    display(to_markdown(exercicios))
+    print("------------------------------------")
+
+    # Integrar as informações
+    resultado_integrado = agente_integrador(topico, explicacao, exercicios)
+    print("\n--- 📚 Resumo e Exercícios Integrados ---\n")
+    display(to_markdown(resultado_integrado))
+    print("------------------------------------------")
